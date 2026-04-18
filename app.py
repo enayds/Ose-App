@@ -7,19 +7,15 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.ensemble import IsolationForest, RandomForestClassifier
-from sklearn.metrics import (
-    accuracy_score, confusion_matrix,
-    f1_score, precision_score, recall_score, roc_auc_score, roc_curve
-)
-from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from imblearn.over_sampling import SMOTE
-import xgboost as xgb
-import lightgbm as lgb
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import LabelEncoder
 import joblib
+import json
 
-# ─── Load models & preprocessors ─────────────────────────────────────────────
+# ─── Load models, preprocessors & saved metrics ──────────────────────────────
+with open('model_metrics.json') as f:
+    model_metrics = json.load(f)
+
 rf_model    = joblib.load('rf_model.pkl')
 xgb_model   = joblib.load('xgb_model.pkl')
 lgbm_model  = joblib.load('lgbm_model.pkl')
@@ -506,203 +502,27 @@ with tab5:
 
     st.markdown("---")
 
-    # ── Optional: retrain on uploaded data ───────────────────────────────────
-    st.markdown("### 🚀 (Optional) Retrain Models on This Dataset")
-    st.caption(
-        "This trains fresh RF · XGBoost · LightGBM models against the Isolation Forest labels above. "
-        "Results are shown for comparison — the saved models above are unaffected."
+    # ── Model Performance — loaded instantly from notebook training ───────────
+    st.markdown("### 📋 Model Performance (from Notebook Training)")
+    st.caption("Metrics were computed during notebook training and saved to model_metrics.json — no retraining needed.")
+
+    comp = pd.DataFrame(model_metrics)
+    comp['CV AUC'] = comp['CV AUC'].apply(lambda x: x if x is not None else '—')
+    st.dataframe(comp, use_container_width=True)
+
+    metrics   = ['Test AUC', 'F1', 'Accuracy', 'Precision', 'Recall']
+    comp_plot = comp[comp['CV AUC'] != '—'].copy()
+    comp_plot[metrics] = comp_plot[metrics].apply(pd.to_numeric, errors='coerce')
+    fig_bar = px.bar(
+        comp_plot.melt(id_vars='Model', value_vars=metrics,
+                       var_name='Metric', value_name='Score'),
+        x='Model', y='Score', color='Metric', barmode='group',
+        title='Model Performance Comparison (Notebook Results)',
+        template=PLOTLY_THEME,
+        color_discrete_sequence=px.colors.qualitative.Set2
     )
-
-    X_full = df_ml[MODEL_FEATURES].fillna(0).values
-    y_full = df_ml['Anomaly'].values
-
-    st.write(f"**Class distribution:** Normal = {(y_full==0).sum():,} | Anomaly = {(y_full==1).sum():,}")
-
-    @st.cache_data
-    def run_ml_pipeline(X, y):
-        X_train_raw, X_test, y_train_raw, y_test = train_test_split(
-            X, y, test_size=0.15, random_state=RANDOM_STATE, stratify=y
-        )
-        smote = SMOTE(random_state=RANDOM_STATE, k_neighbors=5)
-        X_train, y_train = smote.fit_resample(X_train_raw, y_train_raw)
-        sc = StandardScaler()
-        X_train_sc = sc.fit_transform(X_train)
-        X_test_sc  = sc.transform(X_test)
-        return X_train_sc, X_test_sc, y_train, y_test, sc
-
-    if st.button("🚀 Train RF · XGBoost · LightGBM"):
-        with st.spinner("Splitting data, applying SMOTE, training 3 models + IF baseline..."):
-
-            X_train_sc, X_test_sc, y_train, y_test, sc_new = run_ml_pipeline(X_full, y_full)
-
-            def evaluate_model(name, clf):
-                clf.fit(X_train_sc, y_train)
-                y_pred = clf.predict(X_test_sc)
-                y_prob = clf.predict_proba(X_test_sc)[:, 1]
-                cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
-                cv_auc = cross_val_score(clf, X_train_sc, y_train,
-                                         cv=cv, scoring='roc_auc', n_jobs=-1)
-                return {
-                    'name': name, 'clf': clf,
-                    'pred': y_pred, 'prob': y_prob,
-                    'cv_auc':   cv_auc.mean(), 'cv_std': cv_auc.std(),
-                    'test_auc': roc_auc_score(y_test, y_prob),
-                    'test_f1':  f1_score(y_test, y_pred),
-                    'test_acc': accuracy_score(y_test, y_pred),
-                    'precision': precision_score(y_test, y_pred, zero_division=0),
-                    'recall':    recall_score(y_test, y_pred, zero_division=0),
-                }
-
-            scale_pos = (y_train == 0).sum() / (y_train == 1).sum()
-
-            models = [
-                ('Random Forest', RandomForestClassifier(
-                    n_estimators=100, min_samples_leaf=4, max_depth=10,
-                    class_weight='balanced',
-                    random_state=RANDOM_STATE, n_jobs=-1)),
-                ('XGBoost', xgb.XGBClassifier(
-                    n_estimators=100, learning_rate=0.1, max_depth=4,
-                    subsample=0.8, colsample_bytree=0.8,
-                    scale_pos_weight=scale_pos,
-                    use_label_encoder=False, eval_metric='logloss',
-                    random_state=RANDOM_STATE, n_jobs=-1, verbosity=0)),
-                ('LightGBM', lgb.LGBMClassifier(
-                    n_estimators=100, learning_rate=0.1, num_leaves=31,
-                    subsample=0.8, colsample_bytree=0.8,
-                    class_weight='balanced',
-                    random_state=RANDOM_STATE, n_jobs=-1, verbose=-1)),
-            ]
-
-            all_results = [evaluate_model(name, clf) for name, clf in models]
-
-            # Isolation Forest baseline (trained on 11 IF_FEATURES, unscaled)
-            X_train_if_raw = df_ml[IF_FEATURES].fillna(0).values
-            iso_base = IsolationForest(n_estimators=100, contamination=0.10,
-                                       random_state=RANDOM_STATE, n_jobs=-1)
-            iso_base.fit(X_train_if_raw)
-
-            # For test-set evaluation align rows with X_test indices
-            X_test_if = X_train_if_raw  # full set; split indices not tracked separately
-            y_if_pred = np.where(iso_base.predict(X_test_if[:len(y_test)]) == -1, 1, 0)
-            y_if_prob = -iso_base.score_samples(X_test_if[:len(y_test)])
-            all_results.append({
-                'name': 'Isolation Forest (baseline)',
-                'pred': y_if_pred, 'prob': y_if_prob,
-                'cv_auc': None, 'cv_std': None,
-                'test_auc': roc_auc_score(y_test, y_if_prob),
-                'test_f1':  f1_score(y_test, y_if_pred),
-                'test_acc': accuracy_score(y_test, y_if_pred),
-                'precision': precision_score(y_test, y_if_pred, zero_division=0),
-                'recall':    recall_score(y_test, y_if_pred, zero_division=0),
-                'clf': iso_base
-            })
-
-            # ── Model Comparison Table ────────────────────────────────────────
-            st.markdown("### 📋 Model Comparison")
-            comp = pd.DataFrame([{
-                'Model':     r['name'],
-                'CV AUC':    round(r['cv_auc'], 4) if r['cv_auc'] else '—',
-                'Test AUC':  round(r['test_auc'], 4),
-                'F1':        round(r['test_f1'], 4),
-                'Accuracy':  round(r['test_acc'], 4),
-                'Precision': round(r['precision'], 4),
-                'Recall':    round(r['recall'], 4),
-            } for r in all_results])
-            st.dataframe(comp, use_container_width=True)
-
-            # ── Grouped bar chart ─────────────────────────────────────────────
-            metrics   = ['Test AUC', 'F1', 'Accuracy', 'Precision', 'Recall']
-            comp_plot = comp[comp['CV AUC'] != '—']
-            fig_bar = px.bar(
-                comp_plot.melt(id_vars='Model', value_vars=metrics,
-                               var_name='Metric', value_name='Score'),
-                x='Model', y='Score', color='Metric', barmode='group',
-                title='Model Performance Comparison',
-                template=PLOTLY_THEME,
-                color_discrete_sequence=px.colors.qualitative.Set2
-            )
-            fig_bar.update_layout(yaxis_range=[0, 1.1])
-            st.plotly_chart(fig_bar, use_container_width=True)
-
-            # ── ROC Curves ────────────────────────────────────────────────────
-            st.markdown("### 📈 ROC Curves")
-            colours = ['#42A5F5', '#EF5350', '#4CAF50', '#FF9800']
-            fig_roc = go.Figure()
-            for res, colour in zip(all_results, colours):
-                fpr, tpr, _ = roc_curve(y_test, res['prob'])
-                fig_roc.add_trace(go.Scatter(
-                    x=fpr, y=tpr, mode='lines',
-                    name=f"{res['name']} (AUC={res['test_auc']:.4f})",
-                    line=dict(color=colour, width=2)
-                ))
-            fig_roc.add_trace(go.Scatter(
-                x=[0, 1], y=[0, 1], mode='lines',
-                line=dict(dash='dash', color='grey'), name='Random'
-            ))
-            fig_roc.update_layout(
-                title='ROC Curves — All Models (Test Set)',
-                xaxis_title='False Positive Rate',
-                yaxis_title='True Positive Rate',
-                template=PLOTLY_THEME, height=500
-            )
-            st.plotly_chart(fig_roc, use_container_width=True)
-
-            # ── Confusion Matrices ────────────────────────────────────────────
-            st.markdown("### 🔢 Confusion Matrices")
-            sup_results = [r for r in all_results if r['name'] != 'Isolation Forest (baseline)']
-            cols = st.columns(len(sup_results))
-            for col, res in zip(cols, sup_results):
-                cm = confusion_matrix(y_test, res['pred'])
-                fig_cm = px.imshow(
-                    cm, text_auto=True,
-                    labels=dict(x='Predicted', y='Actual'),
-                    x=['Normal', 'Anomaly'],
-                    y=['Normal', 'Anomaly'],
-                    title=res['name'],
-                    color_continuous_scale='Blues',
-                    template=PLOTLY_THEME
-                )
-                col.plotly_chart(fig_cm, use_container_width=True)
-
-            # ── Feature Importances ───────────────────────────────────────────
-            st.markdown("### 🔑 Feature Importances")
-            imp_cols = st.columns(3)
-            for col, res in zip(imp_cols, all_results[:3]):
-                if hasattr(res['clf'], 'feature_importances_'):
-                    fi = pd.Series(res['clf'].feature_importances_,
-                                   index=MODEL_FEATURES).sort_values()
-                    fig_fi = px.bar(fi, orientation='h',
-                                    title=res['name'],
-                                    template=PLOTLY_THEME)
-                    col.plotly_chart(fig_fi, use_container_width=True)
-
-            # ── Ensemble vote on full dataset ─────────────────────────────────
-            st.markdown("### 🗳️ Ensemble-Flagged Vessels")
-            X_full_sc = sc_new.transform(df_ml[MODEL_FEATURES].fillna(0).values)
-            X_full_if = df_ml[IF_FEATURES].fillna(0).values
-
-            df_ml['RF_Pred']   = all_results[0]['clf'].predict(X_full_sc)
-            df_ml['XGB_Pred']  = all_results[1]['clf'].predict(X_full_sc)
-            df_ml['LGBM_Pred'] = all_results[2]['clf'].predict(X_full_sc)
-            df_ml['IF_Pred']   = np.where(iso_base.predict(X_full_if) == -1, 1, 0)
-
-            df_ml['Ensemble_Vote'] = (
-                df_ml[['RF_Pred', 'XGB_Pred', 'LGBM_Pred', 'IF_Pred']].sum(axis=1) >= 2
-            ).astype(int)
-
-            flagged = (df_ml[df_ml['Ensemble_Vote'] == 1]
-                       [['Vessel Name', 'Flag', 'Gear Type', 'Fishing_Hours',
-                         'Has_IMO', 'RF_Pred', 'XGB_Pred', 'LGBM_Pred', 'IF_Pred']]
-                       .sort_values('Fishing_Hours', ascending=False)
-                       .head(50).reset_index(drop=True))
-            flagged['Has IMO'] = flagged['Has_IMO'].map({1: '✅', 0: '❌'})
-            flagged.drop(columns=['Has_IMO'], inplace=True)
-
-            st.metric("Ensemble-Flagged Vessels",
-                      f"{df_ml['Ensemble_Vote'].sum():,} ({df_ml['Ensemble_Vote'].mean()*100:.1f}%)")
-            st.dataframe(flagged, use_container_width=True)
-
-            st.success("✅ All models trained and evaluated!")
+    fig_bar.update_layout(yaxis_range=[0, 1.1])
+    st.plotly_chart(fig_bar, use_container_width=True)
 
 
 # ─── Footer ───────────────────────────────────────────────────────────────────
